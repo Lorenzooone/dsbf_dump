@@ -179,7 +179,46 @@ void is_nitro_save_dump_to_gba_save_cartridge(u8* buffer, u32 size) {
 	}
 }
 
-void is_nitro_save_dump_to_gba_emulated_rom(u8* buffer, u32 size) {
+// GBA ROM requires u32/u16 writes
+static void write_le32(uint8_t* data, uint32_t value) {
+	uint32_t* data32 = (uint32_t*)data;
+	data32[0] = value;
+}
+
+static uint32_t read_le32(const uint8_t* data) {
+	uint32_t* data32 = (uint32_t*)data;
+	return data32[0];
+}
+
+static uint32_t read_le32_u8(const uint8_t* data) {
+	return data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+}
+
+// GBA ROM requires u32/u16 writes...
+// Could align src to improve performance...
+static uint32_t memcpy_u32_out_checksum(uint8_t* dst, const uint8_t* src, size_t size) {
+	uint32_t* dst32 = (uint32_t*)dst;
+	uint32_t checksum = 0;
+	size_t num_iters = (size + 3) >> 2;
+	for(size_t i = 0; i < num_iters; i++) {
+		uint32_t word = read_le32_u8(src + (i << 2));
+		checksum += word;
+		dst32[i] = word;
+	}
+	return checksum;
+}
+
+// GBA ROM requires u32/u16 writes
+static void memcpy_str_u32(uint8_t* dst, const char* src, size_t str_real_size) {
+	memcpy_u32_out_checksum(dst, (const uint8_t*)src, str_real_size);
+	size_t blank_pos = ((str_real_size + 3) >> 2) << 2;
+	uint32_t curr_word = read_le32(dst + blank_pos);
+	size_t in_word_pos = str_real_size & 3;
+	curr_word &=  ~(0xFF << (in_word_pos * 8));
+	write_le32(dst + blank_pos, curr_word);
+}
+
+void is_nitro_save_dump_to_gba_emulated_rom(u8* buffer, u32 size, const char* description) {
 	// If we're on a nitro unit, write the firmware to the GBA ROM space,
 	// which can be really easily dumped from the host machine...
 	REG_WAITCNT = BASE_WAITCNT_VAL;
@@ -189,9 +228,84 @@ void is_nitro_save_dump_to_gba_emulated_rom(u8* buffer, u32 size) {
 	// It can only be restored by writing from the host to register 0x0F841000.
 	static uint8_t pos_buffer = 0x7E;
 	const size_t adsram_size = 0x40000;
+	bool is_connected_to_host = true;
 	u8* data = ((u8*)GBAROM) + (pos_buffer * adsram_size);
-	memcpy(data, buffer, size);
-	printf("CRC32: %08lX\nbuffer at: %p\n", crc32_gzip(buffer, size), data);
+	write_le32(data, 0);
+	write_le32(data + 4, 0);
+
+	if(read_le32(data + 4) != 0)
+		is_connected_to_host = false;
+
+	const uint32_t word_known = 0xDEADBEEF;
+	write_le32(data, word_known);
+
+	while(is_connected_to_host) {
+		swiWaitForVBlank();
+		scanKeys();
+		if(!(keysHeld() & KEY_DEBUG))
+			break;
+	}
+
+	if(read_le32(data + 4) != (~word_known))
+		is_connected_to_host = false;
+
+	if(!is_connected_to_host) {
+		memcpy_u32_out_checksum(data, buffer, size);
+		printf("CRC32: %08lX\nbuffer at: %p\n", crc32_gzip(buffer, size), data);
+		return;
+	}
+
+	// Handle transfers with size > adsram_size. Some FWs are bigger than that...
+	// Common data...
+	write_le32(data + 8, size);
+
+	size_t real_size_desc = strlen(description);
+	size_t size_desc = ((real_size_desc + 1 + 3) >> 2) << 2;
+	if(size_desc > 0x1000)
+		size_desc = 0x1000;
+	write_le32(data + 0xC, size_desc);
+	memcpy_str_u32(data + 0x10, description, real_size_desc);
+	u8* data_post_desc = data + 0x10 + size_desc;
+
+	const size_t max_transfer_size = 0x10000;
+	size_t num_transfers = ((size + max_transfer_size - 1) / max_transfer_size);
+	if(num_transfers == 0)
+		num_transfers = 1;
+	write_le32(data_post_desc, num_transfers);
+
+	for(size_t i = 0; i < num_transfers; i++) {
+		// Reset these data positions...
+		// Order matters
+		write_le32(data, 0);
+		write_le32(data + 4, 0);
+
+		// Curr iteration metadata
+		size_t in_buffer_pos = i * max_transfer_size;
+		size_t curr_transfer_size = size - in_buffer_pos;
+		if(curr_transfer_size > max_transfer_size)
+			curr_transfer_size = max_transfer_size;
+		write_le32(data_post_desc + 4, in_buffer_pos);
+		write_le32(data_post_desc + 8, curr_transfer_size);
+
+		// Actual data
+		uint32_t out_checksum = memcpy_u32_out_checksum(data_post_desc + 0x10, buffer + in_buffer_pos, curr_transfer_size);
+		write_le32(data_post_desc + 0xC, out_checksum);
+
+		// Signal being done
+		write_le32(data, word_known);
+		// Wait for signal back from host
+		while(read_le32(data + 4) != (~word_known))
+			swiWaitForVBlank();
+	}
+
+	// Have the host signal being fully done...
+	while(true) {
+		swiWaitForVBlank();
+		scanKeys();
+		if(keysHeld() & KEY_DEBUG)
+			break;
+	}
+	write_le32(data, word_known ^ 0x11111111);
 }
 
 bool save_dump(const char* path, const char* description, u8* buffer, u32 size) {
@@ -222,6 +336,8 @@ bool save_dump(const char* path, const char* description, u8* buffer, u32 size) 
 				choice = IS_NITRO_CHOICE_GBA_SAVE;
 			else if(keys & KEY_SELECT)
 				choice = IS_NITRO_CHOICE_GBA_ROM;
+			else if(keysHeld() & KEY_DEBUG)
+				choice = IS_NITRO_CHOICE_GBA_ROM;
 		} while(choice == -1);
 
 		switch(choice) {
@@ -229,7 +345,7 @@ bool save_dump(const char* path, const char* description, u8* buffer, u32 size) 
 				is_nitro_save_dump_to_in_memory_buffer(buffer, size);
 				break;
 			case IS_NITRO_CHOICE_GBA_ROM:
-				is_nitro_save_dump_to_gba_emulated_rom(buffer, size);
+				is_nitro_save_dump_to_gba_emulated_rom(buffer, size, description);
 				break;
 			case IS_NITRO_CHOICE_GBA_SAVE:
 				is_nitro_save_dump_to_gba_save_cartridge(buffer, size);
@@ -410,6 +526,10 @@ int main(int argc, char **argv)
 			scanKeys();
 			if(keysDown() & KEY_START) return 0;
 			if(keysDown() & KEY_A) {
+				isNitroUnit = true;
+				break;
+			}
+			if(keysHeld() & KEY_DEBUG) {
 				isNitroUnit = true;
 				break;
 			}

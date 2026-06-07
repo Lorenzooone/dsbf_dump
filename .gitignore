@@ -3,3 +3,4 @@ build
 *.elf
 *.rom
 *.bin
+settings_ds.sh

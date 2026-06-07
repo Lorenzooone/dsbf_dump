@@ -10,6 +10,10 @@
 
 #include "fifoChannels.h"
 
+void VcountHandler() {
+	inputGetAndSend();
+}
+
 void VblankHandler(void) {
 }
 
@@ -20,11 +24,15 @@ int main(void) {
 	ledBlink(0);
 
 	irqInit();
+
+	SetYtrigger(80);
+
+	irqSet(IRQ_VCOUNT, VcountHandler);
 	irqSet(IRQ_VBLANK, VblankHandler);
 	fifoInit();
 	installSystemFIFO();
     initClockIRQTimer(3);
-    irqEnable(IRQ_VBLANK);
+    irqEnable(IRQ_VBLANK | IRQ_VCOUNT);
 
 	u32 isRegularDS = REG_SNDEXTCNT == 0 ? 1 : 0; // If sound frequency setting is found, then the console is not a DS Phat/Lite
 	fifoSendValue32(FIFO_RETURN, isRegularDS); // notify ARM9 that things ready
